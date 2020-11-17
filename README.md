@@ -1,8 +1,5 @@
 # Person Search with Natural Language Description
 
->PyTorch implementation for "Person Search with Natural Language Description"(CVPR2017)
-
-**Torch Version: [[ShuangLI59/Person-Search-with-Natural-Language-Description]](https://github.com/ShuangLI59/Person-Search-with-Natural-Language-Description)**
 
 ## 0.DataSet
  - Download:
@@ -39,11 +36,7 @@
     - [x] encode the captions
 - [x] DataLoader
     - [x] CUDK-PEDES dataset
-    - [x] sample negative
-- [x]  Model: GNA-RNN
-    - [x] Visual units
-    - [x] Attention over visual units
-    - [x] Word-level gates for visual units
+- [x]  Model
     - [x] train
     - [x] valid
     - [x] test
@@ -57,6 +50,4 @@
     - [x] Front End
     - [ ] Prettify
 
-## References
-- [[ShuangLI59/Person-Search-with-Natural-Language-Description]](https://github.com/ShuangLI59/Person-Search-with-Natural-Language-Description)
 
