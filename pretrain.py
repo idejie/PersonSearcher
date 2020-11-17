@@ -35,7 +35,7 @@ class CUHK_PEDES(Dataset):
     def __getitem__(self, index):
         item = self.dataset[index]
         file_path = item['file_path']
-
+        print(item)
         pid = int(item['id']) - 1
         image_path = os.path.join(self.images_dir, file_path)
         image = Image.open(image_path)

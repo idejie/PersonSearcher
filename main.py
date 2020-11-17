@@ -1,15 +1,15 @@
 import numpy as np
 import torch
 import torch.nn as nn
+from sklearn.metrics import accuracy_score
 from torch.backends import cudnn
 from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from tqdm import tqdm
 
 from dataset import CUHK_PEDES
-from model import GNA_RNN
+from model import GNA_RNN, RankLoss
 from utils.config import Config
 from utils.preprocess import *
 
@@ -59,38 +59,41 @@ class Model(object):
         if conf.action != 'process':
             train_set, valid_set, test_set, vocab = self.load_data()
             conf.vocab_size = vocab['UNK'] + 1
-
-            self.train_set = CUHK_PEDES(conf, train_set, is_train=True)
-            self.valid_query_set = CUHK_PEDES(conf, valid_set, query_or_db='query')
-            self.valid_db_set = CUHK_PEDES(conf, valid_set, query_or_db='db')
-            self.test_query_set = CUHK_PEDES(conf, test_set, query_or_db='query')
-            self.test_db_set = CUHK_PEDES(conf, test_set, query_or_db='db')
+            self.train_set = CUHK_PEDES(conf, train_set, image_caption='caption')
+            self.valid_img_set = CUHK_PEDES(conf, valid_set, image_caption='image')
+            self.valid_cap_set = CUHK_PEDES(conf, valid_set, image_caption='caption')
+            self.test_img_set = CUHK_PEDES(conf, test_set, image_caption='image')
+            self.test_cap_set = CUHK_PEDES(conf, test_set, image_caption='caption')
+            self.conf.num_classes = int(
+                self.train_set.num_classes + self.valid_img_set.num_classes + self.test_img_set.num_classes)
+            self.logger.info(f'all num_classes: {self.conf.num_classes}')
             if conf.parallel:
                 self.train_loader = DataLoader(self.train_set, batch_size=conf.batch_size, num_workers=conf.num_workers,
+                                               shuffle=True,
                                                sampler=DistributedSampler(self.train_set))
-                self.valid_query_loader = DataLoader(self.valid_query_set, batch_size=conf.batch_size,
-                                                     num_workers=conf.num_workers,
-                                                     sampler=DistributedSampler(self.valid_query_set))
-                self.valid_db_loader = DataLoader(self.valid_db_set, batch_size=conf.batch_size,
+                self.valid_img_loader = DataLoader(self.valid_img_set, batch_size=conf.batch_size,
+                                                   num_workers=conf.num_workers,
+                                                   sampler=DistributedSampler(self.valid_img_set))
+                self.valid_cap_loader = DataLoader(self.valid_cap_set, batch_size=conf.batch_size,
+                                                   num_workers=conf.num_workers,
+                                                   sampler=DistributedSampler(self.valid_cap_set))
+                self.test_img_loader = DataLoader(self.test_img_set, batch_size=conf.batch_size,
                                                   num_workers=conf.num_workers,
-                                                  sampler=DistributedSampler(self.valid_db_set))
-                self.test_query_loader = DataLoader(self.test_query_set, batch_size=conf.batch_size,
-                                                    num_workers=conf.num_workers,
-                                                    sampler=DistributedSampler(self.test_query_set))
-                self.test_db_loader = DataLoader(self.test_db_set, batch_size=conf.batch_size,
-                                                 num_workers=conf.num_workers,
-                                                 sampler=DistributedSampler(self.test_db_set))
+                                                  sampler=DistributedSampler(self.test_img_set))
+                self.test_cap_loader = DataLoader(self.test_cap_set, batch_size=conf.batch_size,
+                                                  num_workers=conf.num_workers,
+                                                  sampler=DistributedSampler(self.test_cap_set))
             else:
                 self.train_loader = DataLoader(self.train_set, batch_size=conf.batch_size, num_workers=conf.num_workers,
-                                               shuffle=False)
-                self.valid_query_loader = DataLoader(self.valid_query_set, batch_size=conf.batch_size,
-                                                     num_workers=conf.num_workers)
-                self.valid_db_loader = DataLoader(self.valid_db_set, batch_size=conf.batch_size,
+                                               shuffle=True)
+                self.valid_img_loader = DataLoader(self.valid_img_set, batch_size=conf.batch_size,
+                                                   num_workers=conf.num_workers)
+                self.valid_cap_loader = DataLoader(self.valid_cap_set, batch_size=conf.batch_size,
+                                                   num_workers=conf.num_workers)
+                self.test_img_loader = DataLoader(self.test_img_set, batch_size=conf.batch_size,
                                                   num_workers=conf.num_workers)
-                self.test_query_loader = DataLoader(self.test_query_set, batch_size=conf.batch_size,
-                                                    num_workers=conf.num_workers)
-                self.test_db_loader = DataLoader(self.test_db_set, batch_size=conf.batch_size,
-                                                 num_workers=conf.num_workers)
+                self.test_cap_loader = DataLoader(self.test_cap_set, batch_size=conf.batch_size,
+                                                  num_workers=conf.num_workers)
 
             # init network
             self.net = GNA_RNN(conf)
@@ -100,18 +103,24 @@ class Model(object):
                                                                      output_device=local_rank)
                 self.optimizer = Adam([
                     {'params': self.net.module.language_subnet.parameters(), 'lr': conf.language_lr},
-                    {'params': self.net.module.cnn.parameters(), 'lr': conf.cnn_lr}
+                    {'params': self.net.module.cnn.parameters(), 'lr': conf.cnn_lr},
+                    {'params': self.net.module.img_classifier.parameters(), 'lr': conf.classifier_lr},
+                    {'params': self.net.module.cap_classifier.parameters(), 'lr': conf.classifier_lr}
                 ])
             else:
                 self.optimizer = Adam([
                     {'params': self.net.language_subnet.parameters(), 'lr': conf.language_lr},
-                    {'params': self.net.cnn.parameters(), 'lr': conf.cnn_lr}
+                    {'params': self.net.cnn.parameters(), 'lr': conf.cnn_lr},
+                    {'params': self.net.img_classifier.parameters(), 'lr': conf.classifier_lr},
+                    {'params': self.net.cap_classifier.parameters(), 'lr': conf.classifier_lr}
                 ])
 
-            self.criterion = nn.BCEWithLogitsLoss()
+            self.classifier_loss = nn.CrossEntropyLoss()
+            self.rank_loss = RankLoss(conf)
             all_steps = self.conf.epochs * len(self.train_loader)
             self.lr_scheduler = CosineAnnealingLR(optimizer=self.optimizer,
-                                                  T_max=all_steps / 2 if conf.parallel else all_steps)
+                                                  T_max=all_steps / len(local_rank) if conf.parallel else all_steps)
+            self.cos = nn.CosineSimilarity(dim=-1, eps=1e-6)
 
     def load_data(self):
         train_set_path = os.path.join(self.data_dir, 'train_set.json')
@@ -171,27 +180,36 @@ class Model(object):
         if self.conf.amp:
             scaler = torch.cuda.amp.GradScaler()
         for e in range(self.conf.epochs):
-            for b, (images, captions, labels) in enumerate(self.train_loader):
+            for b, (index, images, captions, img_ids, p_ids) in enumerate(self.train_loader):
                 self.net.train()
                 self.optimizer.zero_grad()
-
-                labels = labels.unsqueeze(-1).float()
                 if self.conf.gpu_id != -1:
                     self.net.cuda()
                     images = images.cuda()
                     captions = captions.cuda()
-                    labels = labels.cuda()
+                    img_ids = img_ids.cuda()
+                    # p_ids = p_ids.cuda()
                 if self.conf.amp:
                     with autocast():
-                        out = self.net(images, captions)
-                        loss = self.criterion(out, labels)
+                        img_feats, img_out, cap_feats, cap_out = self.net(images, captions)
+
+                        loss1 = self.classifier_loss(img_out, img_ids) + self.classifier_loss(cap_out, img_ids)
+                        loss2 = self.rank_loss(img_feats, cap_feats, img_ids, img_ids)
+                        if e >= self.conf.step1:
+                            loss = loss1 + loss2
+                        else:
+                            loss = loss1
                     scaler.scale(loss).backward()
                     scaler.step(self.optimizer)
                     scaler.update()
                 else:
-                    out = self.net(images, captions)
-                    # print(torch.sigmoid(out)[:8], labels[:8])
-                    loss = self.criterion(out, labels)
+                    img_feats, img_out, cap_feats, cap_out = self.net(images, captions)
+                    loss1 = self.classifier_loss(img_out, img_ids) + self.classifier_loss(cap_out, img_ids)
+                    loss2 = self.rank_loss(img_feats, cap_feats, img_ids, img_ids)
+                    if e >= self.conf.step1:
+                        loss = loss1 + loss2
+                    else:
+                        loss = loss1
 
                     loss.backward()
                     self.optimizer.step()
@@ -199,7 +217,7 @@ class Model(object):
                     self.lr_scheduler.step()
 
                 self.logger.info(
-                    f'Epoch {e}/{self.conf.epochs} Batch {b}/{len(self.train_loader)}, Loss:{loss.item():.4f}')
+                    f'Epoch {e}/{self.conf.epochs} Batch {b}/{len(self.train_loader)}, loss_classifier:{loss1.item():.4f},loss_rank:{loss2.item():.4f}')
                 if (b + 1) % self.conf.eval_interval == 0:
                     self.eval()
 
@@ -210,117 +228,143 @@ class Model(object):
     def test(self):
         # test stage
         self.net.eval()
-        n_query = len(self.test_query_loader.dataset)
-        n_database = len(self.test_db_loader.dataset)
+        n_query = len(self.test_cap_set)
+        n_database = len(self.test_cap_set)
         out_matrix = np.zeros((n_query, n_database))
         labels_matrix = np.zeros((n_query, n_database))
-        test_bar = tqdm(total=len(self.test_query_loader) * len(self.test_db_loader.dataset.dataset),
-                        desc='Test Stage')
+        q_pred = []
+        q_true = []
+        d_pred = []
+        d_true = []
         with torch.no_grad():
             # images: for d in db
-            for d, (images, indexes_d, d_ids) in enumerate(self.test_db_loader):
+            query_cap_vectors = []
+            db_img_vectors = []
+            for q, (indexes, _, captions, img_q_ids, p_q_ids) in enumerate(self.test_cap_loader):
+                if self.conf.gpu_id != -1:
+                    captions = captions.cuda()
+                    # repeat image for batch input
+                    # p_d_id_repeat = p_d_id.repeat(len(captions), 1)
+                if self.conf.amp:
+                    with autocast():
+                        _, _, cap_q_feats, cap_q_out = self.net(None, captions)
+                else:
+                    _, _, cap_q_feats, cap_q_out = self.net(None, captions)
+                query_cap_vectors.append((indexes, img_q_ids, cap_q_feats))
+                cap_q_out = nn.Softmax(dim=1)(cap_q_out)
+                y_pred = cap_q_out.argmax(dim=1)
+                y_pred = y_pred.cpu().detach().numpy()
+                y_true = img_q_ids.cpu().detach().numpy()
+                q_pred.append(y_pred)
+                q_true.append(y_true)
+            q_pred = np.concatenate(q_pred)
+            q_true = np.concatenate(q_true)
+            self.logger.info('test caption classifier:')
+            self.classifier_report(q_true, q_pred)
+            for d, (indexes, images, _, img_d_ids, p_d_ids) in enumerate(self.test_img_loader):
                 if self.conf.gpu_id != -1:
                     images = images.cuda()
                 if self.conf.amp:
                     with autocast():
-                        images_feats_out = self.net(images)
+                        img_d_feats, img_d_out, _, _ = self.net(images)
                 else:
-                    images_feats_out = self.net(images)
-                # caption: for q in  query
-                for q, (captions, indexes_q, q_ids) in enumerate(self.test_query_loader):
-                    if self.conf.gpu_id != -1:
-                        captions = captions.cuda()
-                    for image_out, index_d, d_id in zip(images_feats_out, indexes_d, d_ids):
-                        image_out_repeat = image_out.repeat(len(captions), 1)
-                        index_d_repeat = index_d.repeat(len(captions), 1)
-                        d_id_repeat = d_id.repeat(len(captions), 1)
-                        # print(image_out_repeat.shape,index_d_repeat.shape)
-                        if self.conf.amp:
-                            with autocast():
-                                outs = self.net(image_out_repeat, captions, query=True)
-                        else:
-                            outs = self.net(image_out_repeat, captions, query=True)
-                        test_bar.update(1)
-                        outs = torch.sigmoid(outs)
-                        out_matrix[indexes_q, index_d_repeat] = outs.squeeze(1).cpu().detach().numpy()
-                        labels = (d_id_repeat == q_ids) + 0
-                        labels_matrix[indexes_q, index_d_repeat] = labels.numpy()
+                    img_d_feats, img_d_out, _, _ = self.net(images)
+                db_img_vectors.append((indexes, img_d_ids, img_d_feats))
+                img_d_out = nn.Softmax(dim=1)(img_d_out)
+                y_pred = img_d_out.argmax(dim=1)
+                y_pred = y_pred.cpu().detach().numpy()
+                y_true = img_d_ids.cpu().detach().numpy()
+                d_pred.append(y_pred)
+                d_true.append(y_true)
+            d_pred = np.concatenate(d_pred)
+            d_true = np.concatenate(d_true)
+            self.logger.info('test image classifier:')
+            self.classifier_report(d_true, d_pred)
+            for item1 in query_cap_vectors:
+                indexes_q, cap_q_ids, q_vector = item1
+                for item2 in db_img_vectors:
+                    indexes_d, img_d_ids, d_vector = item2
+                    sim = self.cos(q_vector.unsqueeze(1), d_vector)
+                    out_matrix[indexes_q, :][:, indexes_d] = sim.cpu().detach().numpy()
+                    labels = (cap_q_ids.repeat(len(indexes_d), 1).t() == img_d_ids.repeat(len(indexes_q), 1)) + 0
+                    labels_matrix[indexes_q, :][:, indexes_d] = labels.cpu().detach().numpy()
+
         out_matrix = torch.from_numpy(out_matrix)
         labels_matrix = torch.from_numpy(labels_matrix)
-        test_bar.close()
-        if self.conf.gpu_id != -1:
-            out_matrix = out_matrix.cuda()
-            labels_matrix = labels_matrix.cuda()
-        if self.conf.amp:
-            with autocast():
-                loss = self.criterion(out_matrix, labels_matrix)
-        else:
-            loss = self.criterion(out_matrix, labels_matrix)
-        self.logger.info(f'Test average loss: {loss.item():.4f}')
         metrics = self.calculate_metrics(out_matrix, labels_matrix)
-        return loss, metrics
+        return metrics
+
+    def classifier_report(self, y_true, y_pred):
+        self.logger.info(accuracy_score(y_true, y_pred))
 
     def eval(self):
         # eval stage
         self.net.eval()
-        n_query = len(self.valid_query_loader.dataset)
-        n_database = len(self.valid_db_loader.dataset)
+        n_query = len(self.valid_cap_set)
+        n_database = len(self.valid_img_set)
         out_matrix = np.zeros((n_query, n_database))
         labels_matrix = np.zeros((n_query, n_database))
-        eval_bar = tqdm(total=len(self.valid_query_loader) * len(self.valid_db_loader.dataset.dataset),
-                        desc='Eval Stage')
+        q_pred = []
+        q_true = []
+        d_pred = []
+        d_true = []
         with torch.no_grad():
             # images: for d in db
-            for d, (images, indexes_d, d_ids) in enumerate(self.valid_db_loader):
+            query_cap_vectors = []
+            db_img_vectors = []
+            for q, (indexes, _, captions, img_q_ids, p_q_ids) in enumerate(self.valid_cap_loader):
+                if self.conf.gpu_id != -1:
+                    captions = captions.cuda()
+                    # repeat image for batch input
+                    # p_d_id_repeat = p_d_id.repeat(len(captions), 1)
+                if self.conf.amp:
+                    with autocast():
+                        _, _, cap_q_feats, cap_q_out = self.net(None, captions)
+                else:
+                    _, _, cap_q_feats, cap_q_out = self.net(None, captions)
+                query_cap_vectors.append((indexes, img_q_ids, cap_q_feats))
+                cap_q_out = nn.Softmax(dim=1)(cap_q_out)
+                y_pred = cap_q_out.argmax(dim=1)
+                y_pred = y_pred.cpu().detach().numpy()
+                y_true = img_q_ids.cpu().detach().numpy()
+                q_pred.append(y_pred)
+                q_true.append(y_true)
+            q_pred = np.concatenate(q_pred)
+            q_true = np.concatenate(q_true)
+            self.logger.info('caption classifier:')
+            self.classifier_report(q_true, q_pred)
+            for d, (indexes, images, _, img_d_ids, p_d_ids) in enumerate(self.valid_img_loader):
                 if self.conf.gpu_id != -1:
                     images = images.cuda()
                 if self.conf.amp:
                     with autocast():
-                        images_feats_out = self.net(images)
+                        img_d_feats, img_d_out, _, _ = self.net(images)
                 else:
-                    images_feats_out = self.net(images)
-                # caption: for q in  query
-                for q, (captions, indexes_q, q_ids) in enumerate(self.valid_query_loader):
-                    if self.conf.gpu_id != -1:
-                        captions = captions.cuda()
-                    # repeat image for batch input
-                    for image_out, index_d, d_id in zip(images_feats_out, indexes_d, d_ids):
-                        image_out_repeat = image_out.repeat(len(captions), 1)
-                        index_d_repeat = index_d.repeat(len(captions), 1)
-                        d_id_repeat = d_id.repeat(len(captions), 1)
-                        if self.conf.amp:
-                            with autocast():
-                                outs = self.net(image_out_repeat, captions, query=True)
-                        else:
-                            outs = self.net(image_out_repeat, captions, query=True)
-                        eval_bar.update(1)
-                        outs = torch.sigmoid(outs)
-                        if torch.isnan(outs).any():
-                            self.logger.error(outs)
-                            self.logger.error(captions)
-                            self.logger.error(image_out)
-                            self.logger.error(index_d, indexes_q)
-                        out_matrix[indexes_q, index_d_repeat] = outs.squeeze(1).cpu().detach().numpy()
-                        labels = (d_id_repeat == q_ids) + 0
-                        labels_matrix[indexes_q, index_d_repeat] = labels.numpy()
-        eval_bar.close()
+                    img_d_feats, img_d_out, _, _ = self.net(images)
+                db_img_vectors.append((indexes, img_d_ids, img_d_feats))
+                img_d_out = nn.Softmax(dim=1)(img_d_out)
+                y_pred = img_d_out.argmax(dim=1)
+                y_pred = y_pred.cpu().detach().numpy()
+                y_true = img_d_ids.cpu().detach().numpy()
+                d_pred.append(y_pred)
+                d_true.append(y_true)
+            d_pred = np.concatenate(d_pred)
+            d_true = np.concatenate(d_true)
+            self.logger.info('image classifier:')
+            self.classifier_report(d_true, d_pred)
+            for item1 in query_cap_vectors:
+                indexes_q, cap_q_ids, q_vector = item1
+                for item2 in db_img_vectors:
+                    indexes_d, img_d_ids, d_vector = item2
+                    sim = self.cos(q_vector.unsqueeze(1), d_vector)
+                    out_matrix[indexes_q, :][:, indexes_d] = sim.cpu().detach().numpy()
+                    labels = (cap_q_ids.repeat(len(indexes_d), 1).t() == img_d_ids.repeat(len(indexes_q), 1)) + 0
+                    labels_matrix[indexes_q, :][:, indexes_d] = labels.cpu().detach().numpy()
+
         out_matrix = torch.from_numpy(out_matrix)
         labels_matrix = torch.from_numpy(labels_matrix)
-
-        if self.conf.gpu_id != -1:
-            out_matrix = out_matrix.cuda()
-            labels_matrix = labels_matrix.cuda()
-        if self.conf.amp:
-            with autocast():
-                loss = self.criterion(out_matrix, labels_matrix)
-        else:
-            loss = self.criterion(out_matrix, labels_matrix)
-        if torch.isnan(loss).any():
-            self.logger.error(out_matrix)
-            self.logger.error(labels)
-        self.logger.info(f'Eval average loss: {loss.item():.4f}')
         metrics = self.calculate_metrics(out_matrix, labels_matrix)
-        return loss, metrics
+        return metrics
 
     def query_transform(self, query):
         w2i_file = os.path.join(self.vocab_dir, 'w2i.json')
